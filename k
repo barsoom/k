@@ -2541,7 +2541,7 @@ def redis_failover
   redis_cluster = ARGV.delete_at(0)
   abort "Must pass name of redis cluster, eg. k redis:failover <cluster-name>" unless redis_cluster
 
-  if kubectl?("get redisfailover #{redis_cluster}-redis")
+  if kubectl?("get redisfailovers.databases.spotahome.com #{redis_cluster} -o yaml")
     # We're using Spotahome's Redis Operator
 
     # Remember current master pod for eviction later on
@@ -2553,12 +2553,12 @@ def redis_failover
     abort "Error: no master pod name found in endpoint YAML for #{redis_cluster}-redis-master" unless master_pod
 
     # Use Sentinel to failover
-    sentinel_endpoint_yaml = read_kubectl "get endpoints/rfs-#{redis_cluster}-redis --ignore-not-found -o yaml"
-    abort "Error: no sentinel endpoint found for #{redis_cluster} (looked for rfs-#{redis_cluster}-redis)" if sentinel_endpoint_yaml.empty?
+    sentinel_endpoint_yaml = read_kubectl "get endpoints/rfs-#{redis_cluster} --ignore-not-found -o yaml"
+    abort "Error: no sentinel endpoint found for #{redis_cluster} (looked for rfs-#{redis_cluster})" if sentinel_endpoint_yaml.empty?
 
     sentinel_endpoint = YAML.safe_load(sentinel_endpoint_yaml)
     sentinel_pod = sentinel_endpoint.dig("subsets", 0, "addresses", 0, "targetRef", "name")
-    abort "Error: no sentinel pod name found in endpoint YAML for rfs-#{redis_cluster}-redis" unless sentinel_pod
+    abort "Error: no sentinel pod name found in endpoint YAML for rfs-#{redis_cluster}" unless sentinel_pod
 
     puts "Running redis-cli with SENTINEL FAILOVER command on #{sentinel_pod}..."
     kubectl("exec -c sentinel -it #{sentinel_pod} -- redis-cli -p 26379 SENTINEL FAILOVER mymaster") or abort("Error: failed to failover master")
