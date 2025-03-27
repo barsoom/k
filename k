@@ -179,8 +179,8 @@ def print_commands
   puts "k run <application> <command>" + gray(" run a command using a one off pod")
   puts "k scale <application> <deployment>:<replicas>" + gray(" scale a deployment in an application")
   puts "k secrets [<specific-secret>]" + gray(" lists secrets including usage details")
-  puts "k secrets:create <secret-name>" + gray(" create a new secret")
-  puts "k secrets:edit <secret-name>" + gray(" edit a secret")
+  puts "k secrets:create <secret-name> [<namespace>]" + gray(" create a new secret")
+  puts "k secrets:edit <secret-name> [<namespace>]" + gray(" edit a secret")
   puts "k secrets:get <secret-name> <key>" + gray(" get a single secret value")
   puts "k secrets:set <secret-name> <key>=<value> [<key2>=<value2> ...]" + gray(" set new secret values")
   puts "k secrets:unset <secret-name> <key> [<key2> ...]" + gray(" unset / delete secret values")
@@ -1714,17 +1714,20 @@ end
 
 def secrets_edit
   shared_secret = ARGV.delete_at(0)
+  namespace = ARGV.delete_at(0) || "default"
   abort "Must pass name of secret, eg. k secrets:edit <shared-secret-name>" unless shared_secret
   abort "Missing $EDITOR environment variable, eg: export EDITOR='code --wait --new-window'" unless ENV.key?("EDITOR")
+
+  namespace_prefix = namespace == "default" ? "" : "#{namespace}__"
 
   in_argo_repo do
     require "base64"
 
-    original_secret = YAML.safe_load read_kubectl("get secret #{shared_secret} -o yaml")
+    original_secret = YAML.safe_load read_kubectl("get secret #{shared_secret} --namespace #{namespace} -o yaml")
     original_env = original_secret.fetch("data").transform_values(&Base64.method(:strict_decode64))
 
     # Write temporary file and launch editor
-    tmp_file = "/#{Dir.tmpdir}/#{shared_secret}.yaml"
+    tmp_file = "/#{Dir.tmpdir}/#{namespace_prefix}#{shared_secret}.yaml"
     File.write tmp_file, original_env.to_yaml.delete_prefix("---\n")
     system "#{ENV.fetch('EDITOR')} #{tmp_file}"
 
@@ -1740,7 +1743,7 @@ def secrets_edit
     original_secret["data"] = data
 
     File.write(tmp_file, original_secret.to_yaml)
-    kubeseal tmp_file, "applications/shared-secrets/#{shared_secret}.yaml"
+    kubeseal tmp_file, "applications/shared-secrets/#{namespace_prefix}#{shared_secret}.yaml"
     File.delete tmp_file
 
     changed_variables = new_env.keys.select do |name|
@@ -1749,7 +1752,7 @@ def secrets_edit
     added_variables = new_env.keys - original_env.keys
     deleted_variables = original_env.keys - new_env.keys
 
-    commit_message = "shared-secrets: edited #{shared_secret}\n\n"
+    commit_message = "shared-secrets: edited #{shared_secret} in namespace #{namespace}\n\n"
     commit_message << "Changed: #{changed_variables.join(' ')}\n" unless changed_variables.empty?
     commit_message << "Added: #{added_variables.join(' ')}\n" unless added_variables.empty?
     commit_message << "Deleted: #{deleted_variables.join(' ')}\n" unless deleted_variables.empty?
@@ -1888,18 +1891,23 @@ end
 
 def secrets_create
   secret = ARGV.delete_at(0)
+  namespace = ARGV.delete_at(0) || "default"
+
   abort "Must pass name of the new secret, eg. k secrets:create <secret-name>" unless secret
   abort "Missing $EDITOR environment variable, eg: export EDITOR='code --wait --new-window'" unless ENV.key?("EDITOR")
 
   require "base64"
 
   in_argo_repo do
-    secret_path = "applications/shared-secrets/#{secret}.yaml"
+    namespace_prefix = namespace == "default" ? "" : "#{namespace}__"
+    secret_path = "applications/shared-secrets/#{namespace_prefix}#{secret}.yaml"
+
     if File.exist?(secret_path)
-      abort "Error: A secret named '#{secret}' already exists, run 'k secrets:edit #{secret}' to edit it"
+      abort "Error: A secret named '#{secret}' in namespace #{namespace} already exists, run 'k secrets:edit #{secret}#{optional_namespace}' to edit it"
     end
 
-    tmp_file = "/#{Dir.tmpdir}/#{secret}.yaml"
+    optional_namespace_in_cli_command = namespace == "default" ? "" : " #{namespace}"
+    tmp_file = "/#{Dir.tmpdir}/#{namespace_prefix}#{secret}.yaml"
     File.write(
       tmp_file,
       <<~YAML,
@@ -1918,7 +1926,7 @@ def secrets_create
     secret_yaml = {
       "apiVersion" => "v1",
       "kind" => "Secret",
-      "metadata" => { "name" => secret },
+      "metadata" => { "name" => secret, "namespace" => namespace },
       "type" => "opaque",
       "data" => data,
     }.to_yaml
@@ -1928,10 +1936,10 @@ def secrets_create
     File.delete tmp_file
 
     system_or_die "git add #{secret_path}"
-    system_or_die %(git commit -m "shared-secrets: add #{secret}" --quiet)
+    system_or_die %(git commit -m "shared-secrets: add #{secret} in namespace #{namespace}" --quiet)
     safe_git_push
 
-    puts "Successfully created the secret '#{secret}'"
+    puts "Successfully created the secret '#{secret}' in namespace #{namespace}"
   end
 end
 
