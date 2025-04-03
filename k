@@ -1902,11 +1902,12 @@ def secrets_create
     namespace_prefix = namespace == "default" ? "" : "#{namespace}__"
     secret_path = "applications/shared-secrets/#{namespace_prefix}#{secret}.yaml"
 
+    optional_namespace_in_cli_command = namespace == "default" ? "" : " #{namespace}"
+
     if File.exist?(secret_path)
-      abort "Error: A secret named '#{secret}' in namespace #{namespace} already exists, run 'k secrets:edit #{secret}#{optional_namespace}' to edit it"
+      abort "Error: A secret named '#{secret}' in namespace #{namespace} already exists, run 'k secrets:edit #{secret}#{optional_namespace_in_cli_command}' to edit it"
     end
 
-    optional_namespace_in_cli_command = namespace == "default" ? "" : " #{namespace}"
     tmp_file = "/#{Dir.tmpdir}/#{namespace_prefix}#{secret}.yaml"
     File.write(
       tmp_file,
