@@ -105,7 +105,9 @@ def get_tracked_resources(kind, application)
   resources.select do |item|
     annotations = item.dig("metadata", "annotations") || {}
     tracking_id = annotations["argocd.argoproj.io/tracking-id"]
-    tracking_id&.start_with?("#{application}:")
+
+    tracking_id&.start_with?("#{application}:") || # ArgoCD v3
+      item.dig("metadata", "labels", "argocd.argoproj.io/instance") == application # ArgoCD v2
   end
 end
 
