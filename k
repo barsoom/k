@@ -12,6 +12,11 @@ require "yaml"
 require "tmpdir"
 require "uri"
 
+# Older versions of YAML (ie. in Ruby 2.5) don't have unsafe_load
+def yaml_load(string)
+  YAML.respond_to?(:unsafe_load) ? YAML.unsafe_load(string) : YAML.load(string)
+end
+
 # rubocop:disable Style/StringConcatenation
 
 K_CONFIG_FILE = "#{ENV.fetch('HOME')}/.k/config".freeze
@@ -33,7 +38,7 @@ K_CONFIG = YAML.load_file(K_CONFIG_FILE)
 
 if (K_CONTEXT = K_CONFIG["contexts"][K_CONFIG["context"]])
   ORGANIZATION = K_CONTEXT.fetch("github_organization").freeze
-  GIT_HOST = URI(K_CONTEXT.fetch("repository")).host.freeze
+  GIT_HOST = K_CONTEXT.fetch("repository")[/[a-zA-Z]+.com/].freeze
   REPO_NAME = K_CONFIG["context"].freeze
   INTERNAL_REPO_PATH = "#{ENV.fetch('HOME')}/.k/#{REPO_NAME}".freeze
   REGISTRY = "#{K_CONTEXT.fetch('registry')}/#{K_CONTEXT.fetch('registry_namespace')}".freeze
@@ -59,6 +64,10 @@ end
 
 def yellow(string)
   $stdout.tty? ? "\033[33m#{string}\e[0m" : string
+end
+
+def red(string)
+  $stdout.tty? ? "\e[31m#{string}\e[0m" : string
 end
 
 def blue(string)
@@ -102,7 +111,7 @@ end
 
 def resources_for_argocd_application(kind, application)
   yaml_output = read_kubectl("get #{kind} -o yaml")
-  resources = YAML.load(yaml_output).fetch("items")
+  resources = yaml_load(yaml_output).fetch("items")
   resources.select do |item|
     annotations = item.dig("metadata", "annotations") || {}
     tracking_id = annotations["argocd.argoproj.io/tracking-id"]
@@ -184,6 +193,9 @@ def print_commands
   puts "k node:failover <node-name>" + gray(" failover all databases on a node in a kubernetes cluster")
   puts "k node:purge-pvcs <node-name> [specific-pvc]" + gray(" delete all PVCs on a node in a kubernetes cluster")
   puts "k node:pvcs [<node-name>]" + gray(" list PVCs in a kubernetes cluster")
+  puts "k opensearch:overview <cluster-name>" + gray(" show OpenSearch health, size and JVM usage")
+  puts "k opensearch:url <cluster-name>" + gray(" output the internal URL for an opensearch cluster")
+  puts "k opensearch:dashboards <cluster-name>" + gray(" access opensearch dashboards for a cluster")
   puts "k pg" + gray(" list postgres related commands")
   puts "k redis" + gray(" list redis related commands")
   puts "k releases <application>" + gray(" lists the past 15 releases for an application")
@@ -447,7 +459,7 @@ def contexts_add
     puts ""
     puts bold "Description"
     puts "Adds a k context. A context is a combination of:"
-    puts "1. A GitHub/GitLab repository containing ArgoCD platform and applications manifests"
+    puts "1. A GitHub/GitLab/Gitea repository containing ArgoCD platform and applications manifests"
     puts "2. A Docker registry + namespace containing Docker images to be deployed as applications"
     puts "3. A Kubernetes cluster (ie. a locally configured kubectl context)"
     exit
@@ -455,8 +467,7 @@ def contexts_add
 
   require "fileutils"
 
-  uri = URI(repository_url)
-  abort "Error: URL must be a GitHub/GitLab repository" unless ['github.com', 'gitlab.com'].include?(uri.host)
+  abort "Error: URL must be a GitHub/GitLab/Gitea repository" unless repository_url.match(/git(hub|lab|ea).com/)
 
   puts ""
   puts "Verifying access to #{repository_url}..."
@@ -486,8 +497,9 @@ def contexts_add
   puts "Write access verified ✅"
   puts ""
 
-  github_organization, repository_name = uri.path.delete_prefix("/").split("/")
-  repository_name = repository_name.delete_suffix(".git")
+  # Could be either a HTTP or SSH URL. Eg.
+  # https://github.com/myorg/myrepo.git or git@github.com:myorg/myrepo.git
+  github_organization, repository_name = repository_url.delete_suffix(".git").split(%r{:|/}).last(2)
 
   default_context_name = repository_name
   print "What would you like to name this context? [#{default_context_name}] "
@@ -615,7 +627,7 @@ def kibana
   end
 
   5601.upto(5700) do |port|
-    # If we can connect to the port another kibana is already active and we skip to the next port
+    # If we can connect to the port it is used by another process so we skip to the next port
     next if TCPSocket.new("127.0.0.1", port).close.nil? rescue false # rubocop:disable Style/RescueModifier
 
     puts "Making kibana accessible at: http://#{hostname}:#{port}/app/monitoring#/overview"
@@ -778,17 +790,17 @@ module Pg
     cluster = read_kubectl("get cluster #{cluster_name} -o yaml")
     abort "Error: cluster '#{cluster_name}' not found" if cluster.empty?
 
-    cluster = YAML.load(cluster)
+    cluster = yaml_load(cluster)
     user ||= cluster_name
 
     app_secret = read_kubectl("get secret #{cluster_name}-app -o yaml")
     abort "ERROR: Could not find authentication secret for '#{cluster_name}'" if app_secret.empty?
-    app_secret = YAML.load(app_secret).fetch("data")
+    app_secret = yaml_load(app_secret).fetch("data")
 
     if user == "superuser"
       superuser_secret = read_kubectl("get secret #{cluster_name}-superuser -o yaml")
       abort "ERROR: Could not find superuser secret for '#{cluster_name}'" if superuser_secret.empty?
-      superuser_secret = YAML.load(superuser_secret).fetch("data")
+      superuser_secret = yaml_load(superuser_secret).fetch("data")
 
       # Superuser secrets use * as dbname since they can theoretically connect to any database,
       # however this doesn't provide valid URL's to successfully connect via psql.
@@ -871,7 +883,7 @@ def pg_failover
   #   }
   #   ...
   # }
-  status = YAML.load(status_yaml)
+  status = yaml_load(status_yaml)
   instance_state = status.dig("cluster", "status", "instancesReportedState")
   non_primary_instance = instance_state.find { |_, state| !state["isPrimary"] }
   abort "No non-primary instance found for cluster '#{cluster}'" unless non_primary_instance
@@ -1150,13 +1162,24 @@ def pg_unused_indexes
   SQL
 end
 
-# TODO: should have a configurable timeout (sleep duration) for long running commands
 def run
   application = ARGV.delete_at(0)
   disable_timeout = ARGV.delete("--disable-timeout")
 
-  abort "Must pass name of application, eg. k run <application> <command> [--disable-timeout]" unless application
-  abort "Must pass command to run, eg. k run <application> <command> [--disable-timeout]" if ARGV.empty?
+  # Handle --tag=<tag> argument, can be passed as --tag=<tag> or --tag <tag> and must be before the command
+  if ARGV[0]&.start_with?("--tag=")
+    tag = ARGV.delete_at(0).split("=", 2).last
+    abort "ERROR: Must provide a tag value with --tag=" if tag.empty?
+  elsif ARGV[0] == "--tag"
+    ARGV.delete_at(0)
+    tag = ARGV.delete_at(0)
+    abort "ERROR: Must provide a tag value with --tag" if tag.nil? || tag.empty?
+  elsif ARGV.any? { |arg| arg == "--tag" || arg.start_with?("--tag=") }
+    puts yellow('Warning: ') + gray("--tag argument will be part of the running command, if you intended to set the image tag you must pass it before the command")
+  end
+
+  abort "Must pass name of application, eg. k run <application> [--tag=<tag>] <command> [--disable-timeout] " unless application
+  abort "Must pass command to run, eg. k run <application> [--tag=<tag>] <command> [--disable-timeout]" if ARGV.empty?
 
   resources = resources_for_argocd_application("deployments", application)
   if resources.empty?
@@ -1186,6 +1209,13 @@ def run
   require "json" # for to_json
 
   pod_name = "#{application}-run-#{SecureRandom.hex(3)}"
+  image = run_container.fetch("image")
+
+  # replace image tag if --tag was provided
+  if tag
+    image = "#{image.split(':').first}:#{tag}"
+    puts gray("applying --tag argument to image: #{image}")
+  end
 
   pod_template = {
     apiVersion: "v1",
@@ -1199,7 +1229,7 @@ def run
       containers: other_containers + [
         {
           name: "run",
-          image: run_container.fetch("image"),
+          image: image,
           envFrom: run_container["envFrom"] || [],
           env: run_container["env"] || [],
           imagePullPolicy: "IfNotPresent",
@@ -1525,7 +1555,7 @@ def elasticsearch_url
   require "base64"
 
   secret = read_kubectl("get secret #{elasticsearch_cluster}-es-elastic-user -o yaml")
-  password = YAML.load(secret).fetch("data").fetch("elastic")
+  password = yaml_load(secret).fetch("data").fetch("elastic")
   decoded_password = Base64.strict_decode64(password)
 
   puts "http://elastic:#{decoded_password}@#{elasticsearch_cluster}-es-http:9200"
@@ -1779,6 +1809,9 @@ def secrets_edit
   in_argo_repo do
     require "base64"
 
+    shared_secret_path = "applications/shared-secrets/#{namespace_prefix(namespace)}#{shared_secret}.yaml"
+    abort "Error: no shared secret named '#{shared_secret}' found in repo" unless File.exist?(shared_secret_path)
+
     original_secret = YAML.safe_load read_kubectl("get secret #{shared_secret} --namespace #{namespace} -o yaml")
     original_env = original_secret.fetch("data").transform_values(&Base64.method(:strict_decode64))
 
@@ -1799,7 +1832,7 @@ def secrets_edit
     original_secret["data"] = data
 
     File.write(tmp_file, original_secret.to_yaml)
-    kubeseal tmp_file, "applications/shared-secrets/#{namespace_prefix(namespace)}#{shared_secret}.yaml"
+    kubeseal tmp_file, shared_secret_path
     File.delete tmp_file
 
     changed_variables = new_env.keys.select do |name|
@@ -1994,6 +2027,11 @@ def secrets_create
     new_env = YAML.load_file(tmp_file)
     File.delete(tmp_file)
 
+    # Can happen if the user eg. deletes everything in the editor
+    unless new_env.is_a?(Hash) && !new_env.empty?
+      abort "Error: No environment variables found, aborting secret creation."
+    end
+
     data = new_env.transform_values(&:to_s).transform_values(&Base64.method(:strict_encode64))
 
     secret_yaml = {
@@ -2071,6 +2109,7 @@ def playground
     else
       ARGV.delete_at(0)
     end
+
   abort "Error: node '#{node_hostname}' not found" unless kubectl("get node #{node_hostname} &> /dev/null")
 
   require "securerandom"
@@ -2078,7 +2117,7 @@ def playground
   puts "Enabling privileged mode, use with caution!" if godmode
   puts "Enabling host network mode." if host_network
 
-  image = "reclaimthestack/playground:sha-6048e00b17198cc058286e5b71dd32de807c12bd"
+  image = "reclaimthestack/playground:sha-b595b7a2a6cfbdef99c458332e5a15270b762597"
   name = "playground-#{SecureRandom.hex(3)}"
 
   god_mounts =
@@ -2104,6 +2143,7 @@ def playground
       )
     end
 
+  max_age_seconds = 60 * 60 * 24 * 3 # kill the pod after 3 days to avoid orphaned pods
   kubectl_command = %(
     kubectl --context #{KUBECTL_CONTEXT} run #{name} -it --restart=Never --rm --image #{image} \
     --overrides='
@@ -2112,6 +2152,7 @@ def playground
         "spec": {
           "nodeSelector": { "kubernetes.io/hostname": "#{node_hostname}" },
           "tolerations": [{ "operator": "Exists" }],
+          "activeDeadlineSeconds": #{max_age_seconds},
           "containers": [{
             "name": "#{name}",
             "image": "#{image}",
@@ -2313,8 +2354,8 @@ def generate_deployment
     .match(/# Example values\.yaml:\n([\s\S]*?)\n\n/)[1]
     .gsub(/^# /, "")
   values_string = File.read(values_path)
-  template_values = YAML.load(template_values_string)
-  values = YAML.load(values_string)
+  template_values = yaml_load(template_values_string)
+  values = yaml_load(values_string)
 
   # Handle image:
   if template_values.key?("image") && !values.key?("image")
@@ -2438,8 +2479,8 @@ def generate_resource
     .match(/# Example values\.yaml:\n([\s\S]*?)\n\n/)[1]
     .gsub(/^# /, "")
   values_string = File.read(values_path)
-  template_values = YAML.load(template_values_string)
-  values = YAML.load(values_string)
+  template_values = yaml_load(template_values_string)
+  values = yaml_load(values_string)
 
   # NOTE: We assume that 'resources', 'envFrom' and 'env' nodes exists in all
   # application values.yaml files since "generate application" would create them.
@@ -2475,7 +2516,7 @@ def generate_resource
 end
 
 def node_pvcs
-  all_pvcs = YAML.load read_kubectl("get pvc --all-namespaces -o yaml")
+  all_pvcs = yaml_load read_kubectl("get pvc --all-namespaces -o yaml")
 
   pvcs_per_node = all_pvcs.fetch("items").each_with_object({}) do |pvc, hash|
     node = pvc.dig("metadata", "annotations", "volume.kubernetes.io/selected-node")
@@ -2510,7 +2551,7 @@ def node_failover
   node_exists = kubectl?("get node #{node_name}")
   abort "Error: node '#{node_name}' not found" unless node_exists
 
-  pods_on_node = YAML.unsafe_load(read_kubectl("get pods --field-selector spec.nodeName=#{node_name} -o yaml")).fetch("items")
+  pods_on_node = yaml_load(read_kubectl("get pods --field-selector spec.nodeName=#{node_name} -o yaml")).fetch("items")
 
   primaries = pods_on_node.select do |pod|
     labels = pod.fetch("metadata")["labels"]
@@ -2567,7 +2608,7 @@ def node_purge_pvcs
   node_name = ARGV.delete_at(0)
   abort "Must pass name of node, eg. k node:purge-pvcs <node-name> [specific-pvc]" unless node_name
 
-  all_pvcs = YAML.load read_kubectl("get pvc --all-namespaces -o yaml")
+  all_pvcs = yaml_load read_kubectl("get pvc --all-namespaces -o yaml")
 
   pvcs_on_node = all_pvcs.fetch("items").select do |pvc|
     pvc.dig("metadata", "annotations", "volume.kubernetes.io/selected-node") == node_name
@@ -2624,7 +2665,7 @@ def node_purge_pvcs
 
   5.times do
     sleep 0.5
-    all_pvcs = YAML.load read_kubectl("get pvc --all-namespaces -o yaml")
+    all_pvcs = yaml_load read_kubectl("get pvc --all-namespaces -o yaml")
 
     pvcs_on_node = all_pvcs.fetch("items").select do |pvc|
       pvc.dig("metadata", "annotations", "volume.kubernetes.io/selected-node") == node_name
@@ -2641,6 +2682,142 @@ def node_purge_pvcs
     puts "Remaining PVCs bound to node:"
     puts pvcs_on_node.map { |pvc| "#{pvc.dig("metadata", "namespace")}/#{pvc.dig("metadata", "name")}" }
   end
+end
+
+def opensearch_url
+  opensearch_cluster = ARGV.delete_at(0)
+  abort "Must pass name of opensearch cluster, eg. k opensearch:url <cluster-name>" unless opensearch_cluster
+
+  require "base64"
+
+  secret = read_kubectl("get secret opensearch-#{opensearch_cluster}-credentials -o yaml")
+  abort "ERROR: No credentials secret found for opensearch cluster '#{opensearch_cluster}'" if secret.empty?
+
+  encoded_url = yaml_load(secret).fetch("data").fetch("admin_uri")
+  url = Base64.strict_decode64(encoded_url)
+
+  puts url
+end
+
+def opensearch_dashboards
+  opensearch_cluster = ARGV.delete_at(0)
+  abort "Must pass name of opensearch cluster, eg. k opensearch:dashboard <cluster-name>" unless opensearch_cluster
+
+  require "socket"
+  if ENV["K_LISTEN_ON_ALL_INTERFACES"] == "true"
+    kubectl_address_flag = " --address 0.0.0.0"
+    hostname = Socket.gethostname
+  else
+    kubectl_address_flag = ""
+    hostname = "localhost"
+  end
+
+  require "base64"
+  base64_password = read_kubectl "get secret opensearch-#{opensearch_cluster}-credentials --template={{.data.admin_password}}"
+  abort "ERROR: No credentials secret found for opensearch cluster '#{opensearch_cluster}'" if base64_password.empty?
+
+  password = Base64.decode64(base64_password)
+
+  5601.upto(5700) do |port|
+    # If we can connect to the port it is used by another process so we skip to the next port
+    next if TCPSocket.new("127.0.0.1", port).close.nil? rescue false # rubocop:disable Style/RescueModifier
+
+    puts "Making dashboards accessible at: http://#{hostname}:#{port}/"
+    if system "which pbcopy > /dev/null 2>&1"
+      puts "Storing dashboards password in clipboard..."
+      puts
+      IO.popen("pbcopy", "w") { |clipboard| clipboard.write(password) }
+      puts "Login with username 'admin' and paste the password from your clipboard"
+    else
+      puts "Login with username 'admin' and paste the password '#{password}'"
+    end
+    puts
+    kubectl "port-forward service/opensearch-dashboards-#{opensearch_cluster} #{port}:5601#{kubectl_address_flag}"
+  end
+end
+alias opensearch_dashboard opensearch_dashboards
+
+def opensearch_overview
+  opensearch_cluster = ARGV.delete_at(0)
+  abort "Must pass name of opensearch cluster, eg. k opensearch:overview <cluster-name>" unless opensearch_cluster
+
+  require "base64"
+
+  secret = read_kubectl("get secret opensearch-#{opensearch_cluster}-credentials -o yaml")
+  abort "ERROR: No credentials secret found for opensearch cluster '#{opensearch_cluster}'" if secret.empty?
+
+  encoded_url = yaml_load(secret).fetch("data").fetch("admin_uri")
+  base_url = Base64.strict_decode64(encoded_url)
+
+  require "json"
+
+  cluster_stats_response = read_kubectl("exec opensearch-#{opensearch_cluster}-0 -- curl --silent #{base_url}/_cluster/stats")
+  cluster_stats = begin
+    JSON.parse(cluster_stats_response)
+  rescue JSON::ParserError
+    abort "Error: failed to parse OpenSearch cluster stats response: #{cluster_stats_response}"
+  end
+
+  version_label = cluster_stats.dig("nodes", "versions").join(", ")
+
+  status_badge =
+    case cluster_stats["status"]
+    when "green" then green("Green")
+    when "yellow" then yellow("Yellow")
+    when "red" then red("Red")
+    else
+      cluster_health["status"] ? cluster_health["status"].to_s.capitalize : "Unknown"
+    end
+
+  format_number = lambda do |value|
+    return "—" unless value
+
+    value.to_i.to_s.gsub(/(\d)(?=(\d{3})+(?!\d))/, "\\1,")
+  end
+
+  format_bytes = lambda do |bytes|
+    return "—" unless bytes
+
+    size = bytes.to_f
+    units = %w[B KB MB GB TB PB]
+    unit = units.shift
+
+    while size >= 1024 && !units.empty?
+      size /= 1024.0
+      unit = units.shift
+    end
+
+    format("%0.1f %s", size, unit)
+  end
+
+  heap_used = cluster_stats.dig("nodes", "jvm", "mem", "heap_used_in_bytes")
+  heap_max = cluster_stats.dig("nodes", "jvm", "mem", "heap_max_in_bytes")
+
+  heap_percent = ((heap_used.to_f / heap_max.to_f) * 100).round
+  heap_summary = "#{format_bytes.call(heap_used)} used / #{format_bytes.call(heap_max)} total (#{heap_percent}%)"
+
+  content_width = 72
+  border = "+#{'-' * (content_width + 2)}+"
+
+  pad_line = lambda do |content = ""|
+    visible_length = content.to_s.gsub(/\e\[[\d;]*m/, "").length
+    padding = [content_width - visible_length, 0].max
+
+    puts "| #{content}#{' ' * padding} |"
+  end
+
+  puts
+  puts "#{bold('OpenSearch Overview')}: #{bold(opensearch_cluster)}"
+  puts border
+  pad_line.call("#{gray('Version:')} #{version_label}")
+  pad_line.call("#{gray('State:')} #{status_badge}")
+  pad_line.call("#{gray('Nodes:')} #{format_number.call(cluster_stats.dig("_nodes", "total"))}")
+  pad_line.call("#{gray('Indices:')} #{format_number.call(cluster_stats.dig('indices', 'count'))}")
+  pad_line.call("#{gray('Documents:')} #{format_number.call(cluster_stats.dig('indices', 'docs', 'count'))}")
+  pad_line.call("#{gray('Primary shards:')} #{format_number.call(cluster_stats.dig('indices', 'shards', 'primaries'))}")
+  pad_line.call("#{gray('Data on disk:')} #{format_bytes.call(cluster_stats.dig('indices', 'store', 'size_in_bytes'))}")
+  pad_line.call("#{gray('JVM heap:')} #{heap_summary}")
+  puts border
 end
 
 def restart
@@ -2835,10 +3012,12 @@ def namespace_prefix(namespace)
 end
 
 def verify_inside_context_repository!
-  context_repo = URI K_CONTEXT.fetch("repository").delete_suffix(".git").delete_suffix("/")
-  current_repo = URI `git remote get-url origin`.strip.delete_suffix(".git").delete_suffix("/")
+  # Repos could be either a HTTP or SSH URL. Eg.
+  # https://github.com/myorg/myrepo.git or git@github.com:myorg/myrepo.git
+  context_repo = K_CONTEXT.fetch("repository").delete_suffix(".git").split(%r{:|/}).last(2)
+  current_repo = `git remote get-url origin`.strip.delete_suffix(".git").split(%r{:|/}).last(2)
 
-  unless context_repo.path == current_repo.path
+  unless context_repo == current_repo
     abort "Error: this command must be run from a clone of the context repository (#{context_repo})"
   end
 end
